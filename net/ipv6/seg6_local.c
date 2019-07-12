@@ -441,6 +441,30 @@ drop:
 	return -EINVAL;
 }
 
+static int input_action_end_dt46(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	struct ipv6_sr_hdr *srh;
+	int proto;
+	unsigned int off = 0;
+
+	srh = get_and_validate_srh(skb);
+	if (!srh)
+		goto drop;
+
+	proto = ipv6_find_hdr(skb, &off, -1, NULL, NULL);
+
+	if (proto == IPPROTO_IPIP)
+		return input_action_end_dt4(skb, slwt);
+
+	if (proto == IPPROTO_IPV6)
+		return input_action_end_dt6(skb, slwt);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* push an SRH on top of the current one */
 static int input_action_end_b6(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 {
@@ -618,6 +642,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.action		= SEG6_LOCAL_ACTION_END_DT4,
 		.attrs		= (1 << SEG6_LOCAL_TABLE),
 		.input		= input_action_end_dt4,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_DT46,
+		.attrs		= (1 << SEG6_LOCAL_TABLE),
+		.input		= input_action_end_dt46,
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_B6,
