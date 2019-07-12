@@ -34,6 +34,8 @@
 #include <net/seg6_local.h>
 #include <linux/etherdevice.h>
 #include <linux/bpf.h>
+#include <linux/inetdevice.h>
+#include <net/ip_fib.h>
 
 struct seg6_local_lwt;
 
@@ -399,6 +401,261 @@ drop:
 	return -EINVAL;
 }
 
+static int seg6_table4_lookup(struct sk_buff *skb, u32 tbl_id)
+{
+	struct iphdr *iph;
+	struct fib_result res;
+	int err = -EINVAL;
+	struct fib_table *table;
+	struct net *net = dev_net(skb->dev);
+	struct flowi4	fl4;
+	struct in_device *in_dev;
+	struct in_device *out_dev;
+	struct rtable *rth;
+	struct dst_entry *dst = NULL;
+
+	iph = ip_hdr(skb);
+
+	in_dev = __in_dev_get_rcu(skb->dev);
+	if (!in_dev)
+		return -EINVAL;
+
+	/* Multicast destination */
+	if (ipv4_is_multicast(iph->daddr))
+		goto multicast_input;
+
+	/* Martian source */
+	if (ipv4_is_multicast(iph->saddr) || ipv4_is_lbcast(iph->saddr))
+		return -EINVAL;
+
+	/* Broadcast destination */
+	if (ipv4_is_lbcast(iph->daddr) || (iph->saddr == 0 && iph->daddr == 0))
+		goto brd_input;
+
+	/* Martian source or destination */
+	if (ipv4_is_zeronet(iph->saddr) || ipv4_is_zeronet(iph->daddr))
+		return -EINVAL;
+
+	if (ipv4_is_loopback(iph->daddr)) {
+		/* Martian destination */
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			return -EINVAL;
+	} else if (ipv4_is_loopback(iph->saddr)) {
+		/* Martian source */
+		if (!IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
+			return -EINVAL;
+	}
+
+	/* Route the packet */
+	u32 tos = 0;
+	tos &= IPTOS_RT_MASK;
+	fl4.flowi4_oif = 0;
+	fl4.flowi4_iif = skb->dev->ifindex;
+	fl4.flowi4_mark = skb->mark;
+	fl4.flowi4_tos = tos;
+	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	fl4.flowi4_flags = 0;
+	fl4.daddr = iph->daddr;
+	fl4.saddr = iph->saddr;
+	fl4.flowi4_uid = sock_net_uid(net, NULL);
+
+	/* Get routing table */
+	table = fib_get_table(net, tbl_id);
+	if (!table)
+		goto no_route;
+
+	/* Lookup into the DT4 table */
+	err = fib_table_lookup(table, &fl4, &res, 0);
+	if (err) {
+		goto no_route;
+	}
+
+	/* Broadcast route */
+	if (res.type == RTN_BROADCAST) {
+		/* Broadcast forwarding is enabled on this interface */
+		if (IN_DEV_BFORWARD(in_dev))
+			goto brd_forward;
+		goto brd_input;
+	}
+
+	/* Local route */
+	if (res.type == RTN_LOCAL)
+		goto local_input;
+
+	/* Forwarding is disabled on this interface */
+	if (!IN_DEV_FORWARD(in_dev))
+		goto no_route;
+
+	/* Martian destination */
+	if (res.type != RTN_UNICAST)
+		return -EINVAL;
+
+	goto unicast_input;
+
+brd_forward:
+	/* get a working reference to the output device */
+	out_dev = __in_dev_get_rcu(FIB_RES_DEV(res));
+	if (!out_dev)
+		return -EINVAL;;
+
+	rth = rt_dst_alloc(out_dev->dev, 0, RTN_BROADCAST,
+		    IN_DEV_CONF_GET(in_dev, NOPOLICY),
+			IN_DEV_CONF_GET(out_dev, NOXFRM), false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.input = ip_forward;
+
+	if (res.fi) {
+		struct fib_nh *nh = &FIB_RES_NH(res);
+		if (nh->nh_gw && nh->nh_scope == RT_SCOPE_LINK) {
+			rth->rt_gateway = nh->nh_gw;
+			rth->rt_uses_gateway = 1;
+		}
+
+		if (!rth->rt_gateway)
+			rth->rt_gateway = iph->daddr;
+
+		rth->dst.lwtstate = lwtstate_get(nh->nh_lwtstate);
+	}
+
+	lwtunnel_set_redirect(&rth->dst);
+
+	goto out;
+
+unicast_input:
+	/* get a working reference to the output device */
+	out_dev = __in_dev_get_rcu(FIB_RES_DEV(res));
+	if (!out_dev)
+		return -EINVAL;
+
+	rth = rt_dst_alloc(out_dev->dev, 0, RTN_UNICAST,
+		    IN_DEV_CONF_GET(in_dev, NOPOLICY),
+			IN_DEV_CONF_GET(out_dev, NOXFRM), false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.input = ip_forward;
+
+	if (res.fi) {
+		struct fib_nh *nh = &FIB_RES_NH(res);
+		if (nh->nh_gw && nh->nh_scope == RT_SCOPE_LINK) {
+			rth->rt_gateway = nh->nh_gw;
+			rth->rt_uses_gateway = 1;
+		}
+
+		if (!rth->rt_gateway)
+			rth->rt_gateway = iph->daddr;
+
+		rth->dst.lwtstate = lwtstate_get(nh->nh_lwtstate);
+	}
+
+	lwtunnel_set_redirect(&rth->dst);
+
+	goto out;
+
+local_input:
+	rth = rt_dst_alloc(net->loopback_dev,
+		   RTCF_LOCAL, RTN_LOCAL,
+		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.input = ip_local_deliver;
+
+	if (res.fi) {
+		struct fib_nh *nh = &FIB_RES_NH(res);
+
+		rth->dst.lwtstate = lwtstate_get(nh->nh_lwtstate);
+		if (lwtunnel_input_redirect(rth->dst.lwtstate)) {
+			rth->dst.lwtstate->orig_input = rth->dst.input;
+			rth->dst.input = lwtunnel_input;
+		}
+	}
+
+	goto out;
+
+brd_input:
+
+	rth = rt_dst_alloc(net->loopback_dev,
+		   RTCF_BROADCAST | RTCF_LOCAL, RTN_BROADCAST,
+		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.input = ip_local_deliver;
+
+	if (res.fi) {
+		struct fib_nh *nh = &FIB_RES_NH(res);
+
+		rth->dst.lwtstate = lwtstate_get(nh->nh_lwtstate);
+		if (lwtunnel_input_redirect(rth->dst.lwtstate)) {
+			rth->dst.lwtstate->orig_input = rth->dst.input;
+			rth->dst.input = lwtunnel_input;
+		}
+	}
+
+	goto out;
+
+multicast_input:
+	return ip_route_input(skb, iph->daddr, iph->saddr, 0, skb->dev);
+
+no_route:
+	rth = rt_dst_alloc(net->loopback_dev,
+		   0, RTN_UNREACHABLE,
+		   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+	if (!rth)
+		return -ENOBUFS;
+
+	rth->dst.error= -err;
+	rth->rt_is_input = 1;
+
+	dst = &rth->dst;
+
+	skb_dst_drop(skb);
+	skb_dst_set(skb, dst);
+
+	return -EHOSTUNREACH;
+
+out:
+	rth->rt_is_input = 1;
+
+	dst = &rth->dst;
+
+	skb_dst_drop(skb);
+	skb_dst_set(skb, dst);
+
+	return 0;
+}
+
+static int input_action_end_dt4(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	int err;
+
+	if (!decap_and_validate(skb, IPPROTO_IPIP))
+		goto drop;
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IP);
+
+	skb_set_transport_header(skb, sizeof(struct iphdr));
+
+	rcu_read_lock();
+	err = seg6_table4_lookup(skb, slwt->table);
+	rcu_read_unlock();
+	if (err)
+		goto drop;
+
+	return dst_input(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* push an SRH on top of the current one */
 static int input_action_end_b6(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 {
@@ -571,6 +828,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.action		= SEG6_LOCAL_ACTION_END_DT6,
 		.attrs		= (1 << SEG6_LOCAL_TABLE),
 		.input		= input_action_end_dt6,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_DT4,
+		.attrs		= (1 << SEG6_LOCAL_TABLE),
+		.input		= input_action_end_dt4,
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_B6,
