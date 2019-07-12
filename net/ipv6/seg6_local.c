@@ -34,6 +34,7 @@
 #include <net/seg6_local.h>
 #include <linux/etherdevice.h>
 #include <linux/bpf.h>
+#include <linux/inetdevice.h>
 
 struct seg6_local_lwt;
 
@@ -399,6 +400,47 @@ drop:
 	return -EINVAL;
 }
 
+static int input_action_end_dt4(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	struct iphdr *iph;
+	struct fib_result res;
+	int err;
+	struct net *net = dev_net(skb->dev);
+
+	if (!decap_and_validate(skb, IPPROTO_IPIP))
+		goto drop;
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		goto drop;
+
+	skb->protocol = htons(ETH_P_IP);
+
+	iph = ip_hdr(skb);
+
+	skb_dst_drop(skb);
+
+	res.table = fib_get_table(net, slwt->table);
+	if (res.table == NULL) {
+		goto drop;
+	}
+
+	rcu_read_lock();
+	err = ip_route_input_rcu(skb, iph->daddr, iph->saddr, 0, skb->dev, &res);
+	rcu_read_unlock();
+	if (err)
+		goto drop;
+
+	if (!skb_dst(skb))
+		goto drop;
+
+	return dst_input(skb);
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 /* push an SRH on top of the current one */
 static int input_action_end_b6(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 {
@@ -571,6 +613,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.action		= SEG6_LOCAL_ACTION_END_DT6,
 		.attrs		= (1 << SEG6_LOCAL_TABLE),
 		.input		= input_action_end_dt6,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_DT4,
+		.attrs		= (1 << SEG6_LOCAL_TABLE),
+		.input		= input_action_end_dt4,
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_B6,
