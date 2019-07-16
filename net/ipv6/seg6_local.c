@@ -643,9 +643,7 @@ static int input_action_end_dt4(struct sk_buff *skb,
 
 	skb_set_transport_header(skb, sizeof(struct iphdr));
 
-	rcu_read_lock();
 	err = seg6_table4_lookup(skb, slwt->table);
-	rcu_read_unlock();
 	if (err)
 		goto drop;
 
