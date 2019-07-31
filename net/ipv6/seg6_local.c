@@ -425,9 +425,7 @@ static int input_action_end_dt4(struct sk_buff *skb,
 		goto drop;
 	}
 
-	rcu_read_lock();
 	err = ip_route_input_rcu(skb, iph->daddr, iph->saddr, 0, skb->dev, &res);
-	rcu_read_unlock();
 	if (err)
 		goto drop;
 
