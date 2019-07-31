@@ -2019,7 +2019,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	}
 
 	if (res->table)
-		err = fib_table_lookup(res->table, &fl4, res, 0);
+		err = fib_table_lookup(res->table, &fl4, res, FIB_LOOKUP_IGNORE_LINKSTATE | FIB_LOOKUP_NOREF);
 	else
 		err = fib_lookup(net, &fl4, res, 0);
 
