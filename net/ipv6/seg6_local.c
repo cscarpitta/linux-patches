@@ -465,7 +465,7 @@ static int seg6_table4_lookup(struct sk_buff *skb, u32 tbl_id)
 		goto no_route;
 
 	/* Lookup into the DT4 table */
-	err = fib_table_lookup(table, &fl4, &res, 0);
+	err = fib_table_lookup(table, &fl4, &res, FIB_LOOKUP_NOREF);
 	if (err) {
 		goto no_route;
 	}
